@@ -1,5 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { callKeenable, keenableSearch } from './keenable.js';
+import { getToolRegistry } from '../registry.js';
+import { SearchSelectionController } from '../../controllers/search-selection.js';
+import { getSetting, setSetting } from '../../utils/config.js';
 
 interface CapturedRequest {
   url: string;
@@ -137,5 +143,89 @@ describe('keenableSearch tool', () => {
     stubFetch(makeResponse({ status: 429, body: {} }));
 
     await expect(keenableSearch.invoke({ query: 'q' })).rejects.toThrow('[Keenable API] 429');
+  });
+});
+
+describe('Keenable is opt-in', () => {
+  const KEENABLE_PUBLIC = 'https://api.keenable.ai/v1/search/public';
+  const LANGSEARCH = 'https://api.langsearch.com/v1/web-search';
+  const searchKeys = [
+    'EXASEARCH_API_KEY',
+    'PERPLEXITY_API_KEY',
+    'TAVILY_API_KEY',
+    'LANGSEARCH_API_KEY',
+    'KEENABLE_API_KEY',
+  ];
+  const originalCwd = process.cwd();
+  let directory: string;
+  let savedKeys: (string | undefined)[];
+
+  beforeEach(() => {
+    // Settings live in ./.dexter/settings.json, so run each test in a scratch directory.
+    directory = mkdtempSync(join(tmpdir(), 'dexter-keenable-'));
+    process.chdir(directory);
+    savedKeys = searchKeys.map((key) => process.env[key]);
+    searchKeys.forEach((key) => delete process.env[key]);
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    process.chdir(originalCwd);
+    searchKeys.forEach((key, i) => {
+      if (savedKeys[i] === undefined) delete process.env[key];
+      else process.env[key] = savedKeys[i];
+    });
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  function webSearchTool() {
+    return getToolRegistry('gpt-5.6-sol').find((t) => t.name === 'web_search')?.tool;
+  }
+
+  // Every request fails, so the chain tries each provider in order; record the order.
+  function failingFetch(): string[] {
+    const calls: string[] = [];
+    // @ts-expect-error - test stub
+    globalThis.fetch = async (url: string) => {
+      calls.push(url);
+      return makeResponse({ status: 503, body: { error: 'unavailable' } });
+    };
+    return calls;
+  }
+
+  test('with no key and no selection, web_search stays unregistered', () => {
+    expect(webSearchTool()).toBeUndefined();
+  });
+
+  test('is not a fallback when keyed providers fail and Keenable is not selected', async () => {
+    process.env.LANGSEARCH_API_KEY = 'fixture-key';
+    const calls = failingFetch();
+
+    await expect(webSearchTool()!.invoke({ query: 'q' })).rejects.toThrow('All providers failed');
+    expect(calls).toEqual([LANGSEARCH]);
+  });
+
+  test('selecting it in /search commits without asking for a key', () => {
+    const controller = new SearchSelectionController((message) => {
+      throw new Error(message);
+    });
+    controller.handleProviderSelect('keenable');
+
+    expect(controller.state.appState).toBe('idle');
+    expect(getSetting('webSearchPreferredProvider', '')).toBe('keenable');
+    expect(existsSync('.env')).toBe(false);
+  });
+
+  test('while selected it runs first and keyless, with keyed providers as fallbacks', async () => {
+    setSetting('webSearchPreferredProvider', 'keenable');
+
+    const keylessCalls = failingFetch();
+    await expect(webSearchTool()!.invoke({ query: 'q' })).rejects.toThrow('All providers failed');
+    expect(keylessCalls).toEqual([KEENABLE_PUBLIC]);
+
+    process.env.LANGSEARCH_API_KEY = 'fixture-key';
+    const chainCalls = failingFetch();
+    await expect(webSearchTool()!.invoke({ query: 'q' })).rejects.toThrow('All providers failed');
+    expect(chainCalls).toEqual([KEENABLE_PUBLIC, LANGSEARCH]);
   });
 });
